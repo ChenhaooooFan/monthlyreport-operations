@@ -3,6 +3,9 @@ import pandas as pd
 import json
 import re
 import io
+import csv
+from collections import defaultdict
+from datetime import datetime
 from bs4 import BeautifulSoup
 from PIL import Image
 import openpyxl
@@ -105,8 +108,71 @@ def to_float(s):
     except: return None
 
 def extract_screenshot_metrics(img_file):
-    """Screenshot uploaded for reference only; metrics entered manually."""
     return ""
+
+# ─────────────────────────────────────────────
+# ORDER CSV ANALYSIS
+# ─────────────────────────────────────────────
+def is_live_time(dt):
+    """直播时间段：每天 10:00–18:00 和 19:00–23:00"""
+    h = dt.hour
+    return (10 <= h < 18) or (19 <= h < 23)
+
+def parse_order_csv(file_obj):
+    """
+    解析 TikTok 订单 CSV（逗号分隔，字段内含制表符杂质）。
+    返回 (live_orders, non_live_orders) 两个 dict：{order_id: total_qty}
+    已排除取消订单。
+    """
+    live_orders = {}
+    non_live_orders = {}
+    orders = defaultdict(list)
+
+    content = file_obj.read().decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(content), delimiter=",")
+
+    for row in reader:
+        order_id = row["Order ID"].strip().replace("\t", "")
+        created_time_raw = row["Created Time"].strip().replace("\t", "")
+        qty_raw = row["Quantity"].strip().replace("\t", "")
+        status = row["Order Status"].strip()
+        orders[order_id].append({
+            "created_time": created_time_raw,
+            "status": status,
+            "qty": qty_raw,
+        })
+
+    for order_id, rows in orders.items():
+        status = rows[0]["status"]
+        if "cancel" in status.lower():
+            continue
+
+        try:
+            dt = datetime.strptime(rows[0]["created_time"], "%m/%d/%Y %I:%M:%S %p")
+        except Exception:
+            continue
+
+        total_qty = 0
+        for r in rows:
+            try:
+                total_qty += int(r["qty"])
+            except Exception:
+                pass
+
+        if is_live_time(dt):
+            live_orders[order_id] = total_qty
+        else:
+            non_live_orders[order_id] = total_qty
+
+    return live_orders, non_live_orders
+
+def bucket_counts(order_dict):
+    b1 = sum(1 for q in order_dict.values() if q == 1)
+    b2 = sum(1 for q in order_dict.values() if q == 2)
+    b3 = sum(1 for q in order_dict.values() if q == 3)
+    b4 = sum(1 for q in order_dict.values() if q >= 4)
+    total = len(order_dict)
+    return b1, b2, b3, b4, total
 
 # ─────────────────────────────────────────────
 # SIDEBAR – FILE UPLOADS
@@ -118,6 +184,7 @@ auction_file   = st.sidebar.file_uploader("Auction Report (HTML)", type=["html"]
 cancelled_file = st.sidebar.file_uploader("Cancelled Report (HTML)", type=["html"], key="cancelled")
 returned_file  = st.sidebar.file_uploader("Returned Report (HTML)", type=["html"], key="returned")
 screenshot_file = st.sidebar.file_uploader("核心指标截图 (PNG/JPG)", type=["png","jpg","jpeg"], key="screenshot")
+order_csv_file = st.sidebar.file_uploader("订单明细 CSV（All order...csv）", type=["csv"], key="order_csv")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ✏️ 手动输入核心指标")
@@ -195,8 +262,20 @@ if cancelled_file:
 if returned_file:
     returned_data, returned_tables = parse_html_report(returned_file.read().decode("utf-8"))
 
+# ─────────────────────────────────────────────
+# PARSE ORDER CSV
+# ─────────────────────────────────────────────
+live_orders, non_live_orders = {}, {}
+csv_parse_error = None
+
+if order_csv_file:
+    try:
+        live_orders, non_live_orders = parse_order_csv(order_csv_file)
+    except Exception as e:
+        csv_parse_error = str(e)
+
 # Derived metrics
-total_orders_full = 2603  # from cancelled report Total Orders
+total_orders_full = 2603
 if cancelled_data:
     v = to_float(cancelled_data.get("Total Orders","").replace(",",""))
     if v: total_orders_full = int(v)
@@ -215,7 +294,6 @@ if returned_data:
     v = to_float(returned_data.get("Returned Packages","").replace(",",""))
     if v: returned_pkgs = int(v)
 
-# Auction metrics
 auc_total = 284; auc_cancel = 16; auc_ret = 7
 auc_aov = 40.51; auc_ret_aov = 41.99
 if auction_data:
@@ -248,7 +326,6 @@ sku_rows = [
 st.markdown("# 💅 NailVesta 中台运营分析报告")
 st.markdown(f"**统计周期：{period_label}（本周，11天直播口径）** ｜ 对比维度：上周（7天）& 4月整月周均")
 
-# Summary pills
 st.markdown(f"""
 <div class="summary-pill-row">
   <span class="pill-bad">GMV 周环比 {pct(cur_gmv,prev_gmv):.1f}%</span>
@@ -271,7 +348,6 @@ st.markdown("""
 # ══════════════════════════════════════════════
 st.markdown('<div class="section-title">一、核心经营指标（三期对比）</div>', unsafe_allow_html=True)
 
-# Metrics row
 cols = st.columns(5)
 metrics = [
     ("Orders 订单量", f"{cur_orders:,}", pct(cur_orders,prev_orders), True),
@@ -307,7 +383,6 @@ for i,(lbl,val,chg,invert) in enumerate(metrics2):
     with cols2[i]:
         st.markdown(metric_card(lbl, val, sub), unsafe_allow_html=True)
 
-# Three-period comparison table
 st.markdown("#### 三期指标对照表")
 df_kpi = pd.DataFrame([
     ["Orders 订单量", f"{apr_orders:,.0f}（全渠道）", f"{prev_orders:,}", f"{pct(prev_orders,apr_orders):+.1f}%", f"{cur_orders:,}", f"{pct(cur_orders,prev_orders):+.1f}%", f"{pct(cur_orders,apr_orders):+.1f}%"],
@@ -322,7 +397,6 @@ df_kpi = pd.DataFrame([
 ], columns=["指标","4月周均（基准）","上周","vs4月","本周","WoW↑↓","本周vs4月"])
 st.dataframe(df_kpi, use_container_width=True, hide_index=True)
 
-# Charts
 c1, c2 = st.columns(2)
 with c1:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -588,7 +662,6 @@ with ab:
     </div>
     """, unsafe_allow_html=True)
 
-# Auction detail tables
 auc_detail_a, auc_detail_b = st.columns(2)
 with auc_detail_a:
     st.markdown("**取消产品集中度**")
@@ -622,9 +695,150 @@ with auc_detail_b:
     st.dataframe(df_auc_ri, use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════
-# 五、行动建议
+# 五、直播时段订单件数分布（CSV 驱动）
 # ══════════════════════════════════════════════
-st.markdown('<div class="section-title">五、行动建议（衔接 4 月月报）</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">五、直播时段订单件数分布（订单明细 CSV）</div>', unsafe_allow_html=True)
+
+if csv_parse_error:
+    st.error(f"CSV 解析失败：{csv_parse_error}")
+elif not order_csv_file and not live_orders:
+    st.info("请在左侧上传「订单明细 CSV」（All order...csv）以启用本节分析。")
+else:
+    l1, l2, l3, l4, l_total = bucket_counts(live_orders)
+    n1, n2, n3, n4, n_total = bucket_counts(non_live_orders)
+
+    # Summary metrics row
+    lv_cols = st.columns(5)
+    lv_metrics = [
+        ("直播时段订单总数", f"{l_total:,}", f"占所有有效订单 {l_total/(l_total+n_total)*100:.1f}%", "neutral"),
+        ("买 1 件", f"{l1/l_total*100:.1f}%", f"{l1:,} 单", "neutral"),
+        ("买 2 件", f"{l2/l_total*100:.1f}%", f"{l2:,} 单", "neutral"),
+        ("买 3 件", f"{l3/l_total*100:.1f}%", f"{l3:,} 单", "neutral"),
+        ("买 4+ 件", f"{l4/l_total*100:.1f}%", f"{l4:,} 单", "up"),
+    ]
+    for i, (lbl, val, sub, d) in enumerate(lv_metrics):
+        with lv_cols[i]:
+            st.markdown(metric_card(lbl, val, sub, d), unsafe_allow_html=True)
+
+    # Detail table
+    df_live_dist = pd.DataFrame([
+        {
+            "购买件数": "1 件",
+            "直播时段 订单数": l1,
+            "直播时段 占比": f"{l1/l_total*100:.1f}%",
+            "非直播 订单数": n1,
+            "非直播 占比": f"{n1/n_total*100:.1f}%",
+            "差值（直播−非直播）": f"{l1/l_total*100 - n1/n_total*100:+.1f}pp",
+        },
+        {
+            "购买件数": "2 件",
+            "直播时段 订单数": l2,
+            "直播时段 占比": f"{l2/l_total*100:.1f}%",
+            "非直播 订单数": n2,
+            "非直播 占比": f"{n2/n_total*100:.1f}%",
+            "差值（直播−非直播）": f"{l2/l_total*100 - n2/n_total*100:+.1f}pp",
+        },
+        {
+            "购买件数": "3 件",
+            "直播时段 订单数": l3,
+            "直播时段 占比": f"{l3/l_total*100:.1f}%",
+            "非直播 订单数": n3,
+            "非直播 占比": f"{n3/n_total*100:.1f}%",
+            "差值（直播−非直播）": f"{l3/l_total*100 - n3/n_total*100:+.1f}pp",
+        },
+        {
+            "购买件数": "4+ 件",
+            "直播时段 订单数": l4,
+            "直播时段 占比": f"{l4/l_total*100:.1f}%",
+            "非直播 订单数": n4,
+            "非直播 占比": f"{n4/n_total*100:.1f}%",
+            "差值（直播−非直播）": f"{l4/l_total*100 - n4/n_total*100:+.1f}pp",
+        },
+        {
+            "购买件数": "合计",
+            "直播时段 订单数": l_total,
+            "直播时段 占比": "100%",
+            "非直播 订单数": n_total,
+            "非直播 占比": "100%",
+            "差值（直播−非直播）": "—",
+        },
+    ])
+    st.dataframe(df_live_dist, use_container_width=True, hide_index=True)
+
+    # Chart
+    lv_c1, lv_c2 = st.columns(2)
+    with lv_c1:
+        buckets = ["1 件", "2 件", "3 件", "4+ 件"]
+        live_pcts  = [l1/l_total*100, l2/l_total*100, l3/l_total*100, l4/l_total*100]
+        nolive_pcts = [n1/n_total*100, n2/n_total*100, n3/n_total*100, n4/n_total*100]
+        fig_live = go.Figure()
+        fig_live.add_trace(go.Bar(
+            name="直播时段", x=buckets, y=live_pcts,
+            marker_color="#185FA5",
+            text=[f"{v:.1f}%" for v in live_pcts], textposition="outside",
+        ))
+        fig_live.add_trace(go.Bar(
+            name="非直播时段", x=buckets, y=nolive_pcts,
+            marker_color="#D3D1C7",
+            text=[f"{v:.1f}%" for v in nolive_pcts], textposition="outside",
+        ))
+        fig_live.update_layout(
+            barmode="group", title="直播 vs 非直播 购买件数占比",
+            height=300, margin=dict(l=0, r=0, t=35, b=0),
+            plot_bgcolor="white", paper_bgcolor="white",
+            legend=dict(orientation="h", y=1.12),
+            yaxis=dict(ticksuffix="%", gridcolor="#f0f0ee", range=[0, max(live_pcts+nolive_pcts)*1.2]),
+        )
+        st.plotly_chart(fig_live, use_container_width=True)
+
+    with lv_c2:
+        fig_pie = go.Figure()
+        fig_pie.add_trace(go.Pie(
+            labels=["1 件", "2 件", "3 件", "4+ 件"],
+            values=[l1, l2, l3, l4],
+            marker_colors=["#185FA5", "#1D9E75", "#EF9F27", "#E24B4A"],
+            hole=0.5,
+            textinfo="label+percent",
+            textfont_size=12,
+            domain={"x": [0, 0.48]},
+        ))
+        fig_pie.add_trace(go.Pie(
+            labels=["1 件", "2 件", "3 件", "4+ 件"],
+            values=[n1, n2, n3, n4],
+            marker_colors=["#185FA5", "#1D9E75", "#EF9F27", "#E24B4A"],
+            hole=0.5,
+            textinfo="label+percent",
+            textfont_size=12,
+            domain={"x": [0.52, 1]},
+        ))
+        fig_pie.update_layout(
+            title="直播（左）vs 非直播（右）件数构成",
+            height=300, margin=dict(l=0, r=0, t=35, b=0),
+            paper_bgcolor="white",
+            annotations=[
+                dict(text="直播", x=0.20, y=0.5, font_size=13, showarrow=False),
+                dict(text="非直播", x=0.80, y=0.5, font_size=13, showarrow=False),
+            ],
+            showlegend=False,
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    # Insight
+    diff_multi = (l2+l3+l4)/l_total*100 - (n2+n3+n4)/n_total*100
+    st.markdown(f"""
+    <div class="insight-box insight-blue">
+    <strong>📊 直播时段多件购买能力更强：</strong>
+    直播时段 4+ 件占比 {l4/l_total*100:.1f}%，是非直播时段（{n4/n_total*100:.1f}%）的 {l4/l_total*100 / (n4/n_total*100):.1f} 倍，
+    多件合计（2件+）占比 {(l2+l3+l4)/l_total*100:.1f}% vs 非直播 {(n2+n3+n4)/n_total*100:.1f}%（
+    {"+" if diff_multi > 0 else ""}{diff_multi:.1f}pp），验证直播对高客单价 / 多件购买有显著促进效果。
+    直播时段贡献全部有效订单的 {l_total/(l_total+n_total)*100:.1f}%，是核心流量窗口。
+    </div>
+    """, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════
+# 六、行动建议
+# ══════════════════════════════════════════════
+st.markdown('<div class="section-title">六、行动建议（衔接 4 月月报）</div>', unsafe_allow_html=True)
 act_a, act_b, act_c = st.columns(3)
 
 with act_a:
@@ -666,7 +880,6 @@ with act_c:
 def build_excel():
     wb = openpyxl.Workbook()
 
-    # Colors
     NAVY   = "1F3864"
     BLUE   = "2E75B6"
     LBLUE  = "DEEAF1"
@@ -769,14 +982,12 @@ def build_excel():
         r = 6 + i
         alt = (i % 2 == 1)
         write_data_row(ws1, r, row_data, alt=alt)
-        # Color WoW column
         wow_cell = ws1.cell(row=r, column=6)
         if wow_cell.value and "+" in str(wow_cell.value):
             wow_cell.font = Font(name="Arial", size=10, color="375623", bold=True)
         elif wow_cell.value and "-" in str(wow_cell.value):
             wow_cell.font = Font(name="Arial", size=10, color="7B0000", bold=True)
 
-    # Analysis notes
     ws1.row_dimensions[16].height = 15
     write_section_title(ws1, 17, 1, "关键分析", 7, bg=BLUE)
     notes = [
@@ -848,7 +1059,6 @@ def build_excel():
     t3.font = Font(name="Arial", size=14, bold=True, color=WHITE)
     t3.fill = fill(NAVY); t3.alignment = center()
 
-    # Summary metrics
     ret_summary = [
         ("总退货率", f"{ret_rate:.2f}%", f"4月月均 {apr_ret_rate:.2f}%，↓{abs(pct(ret_rate,apr_ret_rate)):.1f}%", "375623"),
         ("退货包裹（全渠道）", f"{returned_pkgs}", f"11天 · 周均≈{int(returned_pkgs/11*7)}", "1F3864"),
@@ -875,7 +1085,6 @@ def build_excel():
     ]
     for i, row_d in enumerate(ret_data):
         write_data_row(ws3, 9+i, row_d, alt=(i%2==1))
-        # Highlight warehouse faults
         if "↑" in str(row_d[4]):
             for col in range(1, 6):
                 ws3.cell(row=9+i, column=col).fill = fill(LRED)
@@ -979,7 +1188,71 @@ def build_excel():
     ws4.row_dimensions[29].height = 45
     ws4.merge_cells("A29:E29")
 
-    # ── SHEET 5: 行动建议 ──────────────────────────────
+    # ── SHEET 5: 直播时段订单分布 ──────────────────────────────
+    ws_live = wb.create_sheet("直播时段件数分布")
+    ws_live.sheet_view.showGridLines = False
+    ws_live.column_dimensions["A"].width = 14
+    for col in ["B","C","D","E","F"]:
+        ws_live.column_dimensions[col].width = 18
+
+    ws_live.merge_cells("A1:F1")
+    t_live = ws_live.cell(row=1, column=1, value="五、直播时段订单件数分布（订单明细 CSV）")
+    t_live.font = Font(name="Arial", size=14, bold=True, color=WHITE)
+    t_live.fill = fill(NAVY); t_live.alignment = center()
+
+    if live_orders:
+        l1e, l2e, l3e, l4e, l_te = bucket_counts(live_orders)
+        n1e, n2e, n3e, n4e, n_te = bucket_counts(non_live_orders)
+
+        # Summary row
+        write_section_title(ws_live, 3, 1, "直播时段汇总", 6, bg=BLUE)
+        summary_vals = [
+            ("直播订单总数", f"{l_te:,}"),
+            ("买 1 件占比", f"{l1e/l_te*100:.1f}%"),
+            ("买 2 件占比", f"{l2e/l_te*100:.1f}%"),
+            ("买 3 件占比", f"{l3e/l_te*100:.1f}%"),
+            ("买 4+ 件占比", f"{l4e/l_te*100:.1f}%"),
+            ("占全部有效订单", f"{l_te/(l_te+n_te)*100:.1f}%"),
+        ]
+        for i, (lbl, val) in enumerate(summary_vals):
+            ws_live.cell(row=4, column=1+i, value=lbl).font = Font(name="Arial", size=9, color="666666")
+            ws_live.cell(row=4, column=1+i).fill = fill(LGRAY)
+            ws_live.cell(row=4, column=1+i).alignment = center()
+            ws_live.cell(row=4, column=1+i).border = border()
+            ws_live.cell(row=5, column=1+i, value=val).font = Font(name="Arial", size=13, bold=True, color="1F3864")
+            ws_live.cell(row=5, column=1+i).fill = fill(WHITE)
+            ws_live.cell(row=5, column=1+i).alignment = center()
+            ws_live.cell(row=5, column=1+i).border = border()
+
+        write_section_title(ws_live, 7, 1, "直播 vs 非直播 件数分布对比", 6, bg=BLUE)
+        write_header_row(ws_live, 8, ["购买件数","直播 订单数","直播 占比","非直播 订单数","非直播 占比","差值（pp）"])
+        dist_rows = [
+            ["1 件", l1e, f"{l1e/l_te*100:.1f}%", n1e, f"{n1e/n_te*100:.1f}%", f"{l1e/l_te*100-n1e/n_te*100:+.1f}pp"],
+            ["2 件", l2e, f"{l2e/l_te*100:.1f}%", n2e, f"{n2e/n_te*100:.1f}%", f"{l2e/l_te*100-n2e/n_te*100:+.1f}pp"],
+            ["3 件", l3e, f"{l3e/l_te*100:.1f}%", n3e, f"{n3e/n_te*100:.1f}%", f"{l3e/l_te*100-n3e/n_te*100:+.1f}pp"],
+            ["4+ 件", l4e, f"{l4e/l_te*100:.1f}%", n4e, f"{n4e/n_te*100:.1f}%", f"{l4e/l_te*100-n4e/n_te*100:+.1f}pp"],
+            ["合计", l_te, "100%", n_te, "100%", "—"],
+        ]
+        for i, row_d in enumerate(dist_rows):
+            write_data_row(ws_live, 9+i, row_d, alt=(i%2==1), bold=(i==4))
+
+        ws_live.row_dimensions[15].height = 15
+        write_section_title(ws_live, 16, 1, "分析结论", 6, bg=GREEN)
+        conclusion = f"直播时段（每天10:00–18:00 + 19:00–23:00）贡献全部有效订单的 {l_te/(l_te+n_te)*100:.1f}%。4+件购买占比 {l4e/l_te*100:.1f}% 是非直播时段（{n4e/n_te*100:.1f}%）的 {l4e/l_te*100/(n4e/n_te*100):.1f} 倍，多件购买合计（2件+）占比 {(l2e+l3e+l4e)/l_te*100:.1f}% vs 非直播 {(n2e+n3e+n4e)/n_te*100:.1f}%（{(l2e+l3e+l4e)/l_te*100-(n2e+n3e+n4e)/n_te*100:+.1f}pp），验证直播对高客单价/多件购买有显著促进效果。"
+        ws_live.cell(row=17, column=1, value=conclusion)
+        ws_live.cell(row=17, column=1).font = Font(name="Arial", size=10, color="1F3864")
+        ws_live.cell(row=17, column=1).fill = fill(LGREEN)
+        ws_live.cell(row=17, column=1).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws_live.cell(row=17, column=1).border = border()
+        ws_live.row_dimensions[17].height = 50
+        ws_live.merge_cells("A17:F17")
+    else:
+        ws_live.cell(row=3, column=1, value="未上传订单明细 CSV，本节数据为空。请上传后重新生成报告。")
+        ws_live.cell(row=3, column=1).font = Font(name="Arial", size=11, color="888888", italic=True)
+        ws_live.cell(row=3, column=1).alignment = center()
+        ws_live.merge_cells("A3:F3")
+
+    # ── SHEET 6: 行动建议 ──────────────────────────────
     ws5 = wb.create_sheet("行动建议")
     ws5.sheet_view.showGridLines = False
     ws5.column_dimensions["A"].width = 8
@@ -988,7 +1261,7 @@ def build_excel():
     ws5.column_dimensions["D"].width = 18
 
     ws5.merge_cells("A1:D1")
-    t5 = ws5.cell(row=1, column=1, value="五、行动建议（衔接 4 月月报）")
+    t5 = ws5.cell(row=1, column=1, value="六、行动建议（衔接 4 月月报）")
     t5.font = Font(name="Arial", size=14, bold=True, color=WHITE)
     t5.fill = fill(NAVY); t5.alignment = center()
 
@@ -1013,25 +1286,17 @@ def build_excel():
         r = 3 + i
         ws5.row_dimensions[r].height = 45
         bg = priority_fill.get(pri, WHITE)
-        ws5.cell(row=r, column=1, value=num).font = Font(name="Arial", size=11, bold=True, color=WHITE)
-        ws5.cell(row=r, column=1).fill = fill(priority_color.get(pri,"1F3864").replace("🔴","").replace("🟡","").replace("🟢",""))
-        ws5.cell(row=r, column=1).alignment = center(); ws5.cell(row=r, column=1).border = border()
         for col, val in [(2,title),(3,detail),(4,pri)]:
             c = ws5.cell(row=r, column=col, value=val)
             c.font = Font(name="Arial", size=10, bold=(col==2))
             c.fill = fill(bg); c.alignment = Alignment(horizontal="left",vertical="center",wrap_text=True)
             c.border = border()
-        ws5.cell(row=r, column=1).fill = fill(priority_color.get(pri,"1F3864"))
+        c_num = ws5.cell(row=r, column=1, value=num)
+        c_num.font = Font(name="Arial", size=11, bold=True, color=WHITE)
+        c_num.fill = fill(priority_color.get(pri, "1F3864"))
+        c_num.alignment = center(); c_num.border = border()
 
-    # Fix action number cell colors
-    for i, (num, title, detail, pri) in enumerate(actions):
-        r = 3 + i
-        c = ws5.cell(row=r, column=1)
-        c.fill = fill(priority_color.get(pri,"1F3864"))
-        c.font = Font(name="Arial", size=11, bold=True, color=WHITE)
-
-    # Final formatting: freeze panes on all sheets
-    for ws in [ws1,ws2,ws3,ws4,ws5]:
+    for ws in [ws1, ws2, ws3, ws4, ws_live, ws5]:
         ws.freeze_panes = "A3"
 
     buf = io.BytesIO()
@@ -1057,4 +1322,4 @@ if st.button("生成并下载 Excel 报告 ⬇️", type="primary"):
     st.success("✅ Excel 报告已生成！点击上方按钮下载。")
 
 st.markdown("---")
-st.caption("NailVesta 中台运营分析系统 · 数据源：Auction Report / Cancelled Report / Returned Report / 运营截图")
+st.caption("NailVesta 中台运营分析系统 · 数据源：Auction Report / Cancelled Report / Returned Report / 订单明细 CSV / 运营截图")
